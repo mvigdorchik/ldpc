@@ -1,6 +1,7 @@
 #ifndef BP_H
 #define BP_H
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <stdexcept> // required for std::runtime_error
 #include <set>
+#include <unordered_map>
 
 #include "math.h"
 #include "sparse_matrix_base.hpp"
@@ -28,7 +30,8 @@ namespace ldpc {
         enum BpSchedule {
             SERIAL = 0,
             PARALLEL = 1,
-            SERIAL_RELATIVE = 2
+            SERIAL_RELATIVE = 2,
+            PARALLEL_PACKED = 3
         };
 
         enum BpInputType {
@@ -47,6 +50,224 @@ namespace ldpc {
             ~BpEntry() = default;
         };
         using BpSparse = ldpc::gf2sparse::GF2Sparse<BpEntry>;
+
+        class PackedBpDecoder {
+        public:
+            explicit PackedBpDecoder(BpSparse &pcm) : check_count(pcm.m), bit_count(pcm.n) {
+                this->build(pcm);
+            }
+
+            std::vector<uint8_t> &decode_minimum_sum(
+                    std::vector<uint8_t> &syndrome,
+                    const std::vector<double> &channel_probabilities,
+                    const int maximum_iterations,
+                    const double ms_scaling_factor,
+                    std::vector<uint8_t> &decoding,
+                    std::vector<uint8_t> &candidate_syndrome,
+                    std::vector<double> &log_prob_ratios,
+                    std::vector<double> &initial_log_prob_ratios,
+                    int &iterations,
+                    bool &converge) {
+                converge = false;
+                this->initialise_log_domain(channel_probabilities, initial_log_prob_ratios);
+
+                for (int it = 1; it <= maximum_iterations; it++) {
+                    double alpha;
+                    if(ms_scaling_factor == 0.0) {
+                        alpha = 1.0 - std::pow(2.0, -1.0*it);
+                    }
+                    else {
+                        alpha = ms_scaling_factor;
+                    }
+
+                    this->update_check_to_bit_messages(syndrome, candidate_syndrome, alpha);
+                    this->update_log_prob_ratios_and_decoding(
+                            decoding,
+                            candidate_syndrome,
+                            log_prob_ratios,
+                            initial_log_prob_ratios);
+
+                    if (std::equal(candidate_syndrome.begin(), candidate_syndrome.end(), syndrome.begin())) {
+                        converge = true;
+                    }
+
+                    iterations = it;
+
+                    if (converge) {
+                        this->sync_messages_to_pcm();
+                        return decoding;
+                    }
+
+                    this->update_bit_to_check_messages();
+                }
+
+                this->sync_messages_to_pcm();
+                return decoding;
+            }
+
+        private:
+            int check_count;
+            int bit_count;
+            std::vector<int> row_offsets;
+            std::vector<int> col_offsets;
+            std::vector<int> col_edges;
+            std::vector<int> edge_rows;
+            std::vector<int> edge_cols;
+            std::vector<BpEntry *> edges;
+            std::vector<double> bit_to_check_msg;
+            std::vector<double> check_to_bit_msg;
+
+            void build(BpSparse &pcm) {
+                this->row_offsets.assign(this->check_count + 1, 0);
+                this->col_offsets.assign(this->bit_count + 1, 0);
+                this->col_edges.clear();
+                this->edge_rows.clear();
+                this->edge_cols.clear();
+                this->edges.clear();
+
+                std::unordered_map<BpEntry *, int> edge_ids;
+                edge_ids.reserve(static_cast<size_t>(pcm.entry_count()));
+
+                for (int row = 0; row < this->check_count; row++) {
+                    this->row_offsets[row] = static_cast<int>(this->edge_rows.size());
+                    for (auto &e: pcm.iterate_row(row)) {
+                        const int edge = static_cast<int>(this->edge_rows.size());
+                        this->edge_rows.push_back(row);
+                        this->edge_cols.push_back(e.col_index);
+                        this->edges.push_back(&e);
+                        edge_ids.emplace(&e, edge);
+                    }
+                }
+                this->row_offsets[this->check_count] = static_cast<int>(this->edge_rows.size());
+
+                for (int col = 0; col < this->bit_count; col++) {
+                    this->col_offsets[col] = static_cast<int>(this->col_edges.size());
+                    for (auto &e: pcm.iterate_column(col)) {
+                        auto edge_it = edge_ids.find(&e);
+                        if (edge_it == edge_ids.end()) {
+                            throw std::runtime_error("Failed to pack BP matrix edge");
+                        }
+                        this->col_edges.push_back(edge_it->second);
+                    }
+                }
+                this->col_offsets[this->bit_count] = static_cast<int>(this->col_edges.size());
+
+                this->bit_to_check_msg.resize(this->edge_rows.size());
+                this->check_to_bit_msg.resize(this->edge_rows.size());
+            }
+
+            void initialise_log_domain(
+                    const std::vector<double> &channel_probabilities,
+                    std::vector<double> &initial_log_prob_ratios) {
+                for (int i = 0; i < this->bit_count; i++) {
+                    initial_log_prob_ratios[i] = std::log(
+                            (1 - channel_probabilities[i]) / channel_probabilities[i]);
+
+                    for (int edge_offset = this->col_offsets[i];
+                         edge_offset < this->col_offsets[i + 1];
+                         edge_offset++) {
+                        const int edge = this->col_edges[edge_offset];
+                        this->bit_to_check_msg[edge] = initial_log_prob_ratios[i];
+                    }
+                }
+            }
+
+            void update_check_to_bit_messages(
+                    std::vector<uint8_t> &syndrome,
+                    std::vector<uint8_t> &candidate_syndrome,
+                    double alpha) {
+                for (int i = 0; i < this->check_count; i++) {
+                    candidate_syndrome[i] = 0;
+                    int total_sgn = syndrome[i];
+                    int sgn = 0;
+                    double temp = std::numeric_limits<double>::max();
+
+                    for (int edge = this->row_offsets[i];
+                         edge < this->row_offsets[i + 1];
+                         edge++) {
+                        if (this->bit_to_check_msg[edge] <= 0) {
+                            total_sgn += 1;
+                        }
+                        this->check_to_bit_msg[edge] = temp;
+                        double abs_bit_to_check_msg = std::abs(this->bit_to_check_msg[edge]);
+                        if (abs_bit_to_check_msg < temp) {
+                            temp = abs_bit_to_check_msg;
+                        }
+                    }
+
+                    temp = std::numeric_limits<double>::max();
+                    for (int edge_offset = this->row_offsets[i + 1];
+                         edge_offset > this->row_offsets[i];) {
+                        edge_offset--;
+                        sgn = total_sgn;
+                        if (this->bit_to_check_msg[edge_offset] <= 0) {
+                            sgn += 1;
+                        }
+                        if (temp < this->check_to_bit_msg[edge_offset]) {
+                            this->check_to_bit_msg[edge_offset] = temp;
+                        }
+
+                        int message_sign = (sgn % 2 == 0) ? 1.0 : -1.0;
+                        this->check_to_bit_msg[edge_offset] *= message_sign * alpha;
+
+                        double abs_bit_to_check_msg = std::abs(this->bit_to_check_msg[edge_offset]);
+                        if (abs_bit_to_check_msg < temp) {
+                            temp = abs_bit_to_check_msg;
+                        }
+                    }
+                }
+            }
+
+            void update_log_prob_ratios_and_decoding(
+                    std::vector<uint8_t> &decoding,
+                    std::vector<uint8_t> &candidate_syndrome,
+                    std::vector<double> &log_prob_ratios,
+                    const std::vector<double> &initial_log_prob_ratios) {
+                for (int i = 0; i < this->bit_count; i++) {
+                    double temp = initial_log_prob_ratios[i];
+                    for (int edge_offset = this->col_offsets[i];
+                         edge_offset < this->col_offsets[i + 1];
+                         edge_offset++) {
+                        const int edge = this->col_edges[edge_offset];
+                        this->bit_to_check_msg[edge] = temp;
+                        temp += this->check_to_bit_msg[edge];
+                    }
+
+                    log_prob_ratios[i] = temp;
+                    if (temp <= 0) {
+                        decoding[i] = 1;
+                        for (int edge_offset = this->col_offsets[i];
+                             edge_offset < this->col_offsets[i + 1];
+                             edge_offset++) {
+                            const int edge = this->col_edges[edge_offset];
+                            candidate_syndrome[this->edge_rows[edge]] ^= 1;
+                        }
+                    } else {
+                        decoding[i] = 0;
+                    }
+                }
+            }
+
+            void update_bit_to_check_messages() {
+                for (int i = 0; i < this->bit_count; i++) {
+                    double temp = 0;
+                    for (int edge_offset = this->col_offsets[i + 1];
+                         edge_offset > this->col_offsets[i];) {
+                        edge_offset--;
+                        const int edge = this->col_edges[edge_offset];
+                        this->bit_to_check_msg[edge] += temp;
+                        temp += this->check_to_bit_msg[edge];
+                    }
+                }
+            }
+
+            void sync_messages_to_pcm() {
+                for (int edge = 0; edge < static_cast<int>(this->edges.size()); edge++) {
+                    this->edges[edge]->bit_to_check_msg = this->bit_to_check_msg[edge];
+                    this->edges[edge]->check_to_bit_msg = this->check_to_bit_msg[edge];
+                }
+            }
+        };
 
         class BpDecoder {
             // TODO properties should be private and only accessible via getters and setters
@@ -73,6 +294,7 @@ namespace ldpc {
             int random_schedule_seed;
             bool random_serial_schedule;
             ldpc::rng::RandomListShuffle<int> rng_list_shuffle;
+            PackedBpDecoder packed_decoder;
 
             BpDecoder(
                     BpSparse &parity_check_matrix,
@@ -89,7 +311,8 @@ namespace ldpc {
                     pcm(parity_check_matrix), channel_probabilities(std::move(channel_probabilities)),
                     check_count(pcm.m), bit_count(pcm.n), maximum_iterations(maximum_iterations), bp_method(bp_method),
                     schedule(schedule), ms_scaling_factor(min_sum_scaling_factor),
-                    iterations(0) //the parity check matrix is passed in by reference
+                    iterations(0), //the parity check matrix is passed in by reference
+                    packed_decoder(parity_check_matrix)
             {
 
                 this->initial_log_prob_ratios.resize(bit_count);
@@ -165,6 +388,8 @@ namespace ldpc {
                     std::vector<uint8_t> rv_decoding;
                     if (schedule == PARALLEL) {
                         rv_decoding = bp_decode_parallel(syndrome);
+                    } else if (schedule == PARALLEL_PACKED) {
+                        rv_decoding = bp_decode_parallel_packed(syndrome);
                     } else if (schedule == SERIAL || schedule == SERIAL_RELATIVE) {
                         rv_decoding = bp_decode_serial(syndrome);
                     } else {
@@ -183,14 +408,34 @@ namespace ldpc {
                 if (schedule == PARALLEL) {
                     return bp_decode_parallel(input_vector);
                 }
+                if (schedule == PARALLEL_PACKED) {
+                    return bp_decode_parallel_packed(input_vector);
+                }
                 if (schedule == SERIAL || schedule == SERIAL_RELATIVE) {
                     return bp_decode_serial(input_vector);
                 } else { throw std::runtime_error("Invalid BP schedule"); }
 
             }
 
-            std::vector<uint8_t> &bp_decode_parallel(std::vector<uint8_t> &syndrome) {
+            std::vector<uint8_t> &bp_decode_parallel_packed(std::vector<uint8_t> &syndrome) {
+                if (this->bp_method != MINIMUM_SUM) {
+                    throw std::runtime_error("PARALLEL_PACKED currently supports only MINIMUM_SUM");
+                }
 
+                return this->packed_decoder.decode_minimum_sum(
+                        syndrome,
+                        this->channel_probabilities,
+                        this->maximum_iterations,
+                        this->ms_scaling_factor,
+                        this->decoding,
+                        this->candidate_syndrome,
+                        this->log_prob_ratios,
+                        this->initial_log_prob_ratios,
+                        this->iterations,
+                        this->converge);
+            }
+
+            std::vector<uint8_t> &bp_decode_parallel(std::vector<uint8_t> &syndrome) {
                 this->converge = 0;
 
                 this->initialise_log_domain_bp();
@@ -258,10 +503,9 @@ namespace ldpc {
                                 }
 
                                 int message_sign = (sgn % 2 == 0) ? 1.0 : -1.0;
-                                
+
                                 e.check_to_bit_msg *= message_sign * alpha;
 
-                                
                                 double abs_bit_to_check_msg = std::abs(e.bit_to_check_msg);
                                 if (abs_bit_to_check_msg < temp) {
                                     temp = abs_bit_to_check_msg;
@@ -507,9 +751,7 @@ namespace ldpc {
                                 for (auto &g: this->pcm.iterate_row(check_index)) {
                                     if (&g != &e) {
                                         double abs_bit_to_check_msg = std::abs(g.bit_to_check_msg);
-                                        if (abs_bit_to_check_msg < temp) {
-                                            temp = abs_bit_to_check_msg;
-                                        }
+                                        temp = std::min(abs_bit_to_check_msg, temp);
                                         if (g.bit_to_check_msg <= 0) {
                                             sgn += 1;
                                         }
