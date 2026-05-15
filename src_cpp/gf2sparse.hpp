@@ -7,7 +7,7 @@
 #define GF2SPARSE_H
 
 #include <vector>
-#include <iterator>
+#include <cstdint>
 #include "sparse_matrix_base.hpp"
 
 
